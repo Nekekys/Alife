@@ -35,6 +35,8 @@ pub struct WorldConfig {
     pub capacity: usize,
     pub init_agents: usize,
     /// Полная масса мира на клетку. Это число неизменно весь прогон.
+    /// Задаёт плотность населения, а она решает, станет ли охота заметной:
+    /// при вчетверо меньшем значении хищничество остаётся 1% рациона.
     pub mass_per_cell: f32,
     /// Доля свободной массы, лежащая на старте в растениях; остальное — питательные вещества.
     pub init_plant_frac: f32,
@@ -47,7 +49,7 @@ impl Default for WorldConfig {
             height: 256,
             capacity: 12288,
             init_agents: 2000,
-            mass_per_cell: 4.0,
+            mass_per_cell: 16.0,
             init_plant_frac: 0.35,
         }
     }
@@ -82,6 +84,10 @@ pub struct AgentConfig {
     pub eat_rate: f32,
     pub attack_damage: f32,
     pub attack_cost: f32,
+    /// Доля нанесённого урона, достающаяся атакующему сразу; остальное падает
+    /// падалью в клетку жертвы. При 0 атака не кормит вовсе, и связь между
+    /// ударом и наградой приходится искать через ход — для отбора это слишком далеко.
+    pub attack_yield: f32,
     pub repro_threshold: f32,
     /// Доля энергии родителя, уходящая потомку.
     pub repro_share: f32,
@@ -104,8 +110,9 @@ impl Default for AgentConfig {
             metabolism: 0.35,
             move_cost: 0.15,
             eat_rate: 6.0,
-            attack_damage: 14.0,
-            attack_cost: 0.8,
+            attack_damage: 60.0,
+            attack_cost: 1.5,
+            attack_yield: 0.8,
             repro_threshold: 80.0,
             repro_share: 0.4,
             repro_overhead: 0.08,
@@ -134,7 +141,7 @@ pub struct ResourceConfig {
 impl Default for ResourceConfig {
     fn default() -> Self {
         Self {
-            growth_rate: 0.04,
+            growth_rate: 0.12,
             plant_capacity: 8.0,
             plant_seed: 0.02,
             carrion_decay: 0.04,
@@ -169,6 +176,9 @@ impl Config {
         }
         if self.agent.repro_share + self.agent.repro_overhead >= 1.0 {
             return Err("repro_share + repro_overhead должны быть меньше 1".into());
+        }
+        if !(0.0..=1.0).contains(&self.agent.attack_yield) {
+            return Err("attack_yield вне диапазона 0..1".into());
         }
         if self.agent.repro_threshold <= self.agent.death_energy {
             return Err("repro_threshold должен быть выше death_energy".into());

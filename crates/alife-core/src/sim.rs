@@ -228,8 +228,17 @@ impl Sim {
                     let v = occ as usize;
                     let dmg = cfg.agent.attack_damage.min(agents.energy[v]);
                     agents.energy[v] -= dmg;
-                    world.carrion[tcell] += dmg;
+                    let room = (cfg.agent.max_energy - agents.energy[i]).max(0.0);
+                    let (bite, dropped) = split_damage(dmg, cfg.agent.attack_yield, room);
+                    agents.energy[i] += bite;
+                    world.carrion[tcell] += dropped;
+                    if bite > 0.0 {
+                        agents.last_ate[i] = 1.0;
+                    }
                     agents.last_hit[v] = 1.0;
+                    counters.attacks_hit += 1;
+                    counters.damage_dealt += dmg as f64;
+                    counters.predated_mass += bite as f64;
                     if agents.energy[v] <= cfg.agent.death_energy {
                         kill(world, agents, v);
                         counters.deaths_killed += 1;
@@ -265,7 +274,8 @@ impl Sim {
                         agents.energy[i] += got;
                         agents.last_ate[i] = 1.0;
                         counters.eats += 1;
-                        counters.eaten_mass += got as f64;
+                        counters.eaten_plant += from_plant as f64;
+                        counters.eaten_carrion += from_carrion as f64;
                     }
                 }
             }
@@ -369,15 +379,19 @@ impl Sim {
             deaths_starved: c.deaths_starved,
             deaths_killed: c.deaths_killed,
             attacks: c.attacks,
-            kills_per_attack: if c.attacks > 0 {
-                c.deaths_killed as f64 / c.attacks as f64
-            } else {
-                0.0
-            },
+            attacks_hit: c.attacks_hit,
+            kills_per_attack: ratio(c.deaths_killed as f64, c.attacks as f64),
+            hits_per_attack: ratio(c.attacks_hit as f64, c.attacks as f64),
+            kills_per_hit: ratio(c.deaths_killed as f64, c.attacks_hit as f64),
+            carrion_share: ratio(c.eaten_carrion, c.eaten_plant + c.eaten_carrion),
+            animal_share: ratio(
+                c.eaten_carrion + c.predated_mass,
+                c.eaten_plant + c.eaten_carrion + c.predated_mass,
+            ),
             moves_per_agent: c.moves as f64 / denom,
             eats_per_agent: c.eats as f64 / denom,
             attacks_per_agent: c.attacks as f64 / denom,
-            eaten_per_agent: c.eaten_mass / denom,
+            eaten_per_agent: (c.eaten_plant + c.eaten_carrion) / denom,
             births_blocked: c.births_blocked,
         };
         self.counters.reset();
@@ -470,6 +484,26 @@ fn decode_action(out: &[f32]) -> Action {
     }
 }
 
+/// Делит нанесённый урон на укус атакующему и падаль в клетку жертвы.
+///
+/// Укус ограничен тем, сколько энергии атакующий ещё вмещает: сытому не
+/// достаётся ничего, и весь урон уходит падалью. Сумма всегда равна урону —
+/// на этом держится сохранение массы.
+fn split_damage(damage: f32, bite_share: f32, attacker_room: f32) -> (f32, f32) {
+    let bite = (damage * bite_share).clamp(0.0, attacker_room.max(0.0));
+    (bite, damage - bite)
+}
+
+/// Отношение, равное нулю при пустом знаменателе: метрика без событий — это 0, а не NaN.
+#[inline]
+fn ratio(a: f64, b: f64) -> f64 {
+    if b > 0.0 {
+        a / b
+    } else {
+        0.0
+    }
+}
+
 #[inline]
 fn fnv(h: u64, v: u64) -> u64 {
     (h ^ v).wrapping_mul(0x0000_0100_0000_01b3)
@@ -501,6 +535,47 @@ mod tests {
             (after - before).abs() / before < 1e-3,
             "масса уплыла: было {before}, стало {after}"
         );
+    }
+
+    #[test]
+    fn mass_is_conserved_when_attacks_feed_the_attacker() {
+        // Укус перекладывает массу из жертвы в атакующего, а остаток — в падаль.
+        // Если атакующий сыт, весь урон обязан уйти в падаль, а не испариться.
+        for yield_ in [0.5f32, 1.0] {
+            let mut cfg = small_cfg();
+            cfg.agent.attack_yield = yield_;
+            cfg.agent.attack_damage = 60.0;
+            cfg.agent.attack_cost = 0.2;
+            let mut sim = Sim::new(cfg).unwrap();
+            let before = sim.initial_mass();
+            for _ in 0..500 {
+                sim.tick();
+            }
+            let after = sim.total_mass();
+            assert!(
+                (after - before).abs() / before < 1e-3,
+                "укус {yield_}: было {before}, стало {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn damage_splits_without_losing_mass() {
+        // Сытому укус ничего не даёт: весь урон обязан уйти падалью.
+        assert_eq!(split_damage(40.0, 1.0, 0.0), (0.0, 40.0));
+        // Голодному с запасом — ровно оговорённая доля.
+        assert_eq!(split_damage(40.0, 0.75, 100.0), (30.0, 10.0));
+        // Места меньше, чем укус: лишнее падает падалью.
+        assert_eq!(split_damage(40.0, 1.0, 12.0), (12.0, 28.0));
+        // Атака не кормит вовсе.
+        assert_eq!(split_damage(40.0, 0.0, 100.0), (0.0, 40.0));
+
+        for &(d, y, room) in &[(40.0f32, 0.3f32, 5.0f32), (7.5, 1.0, 3.25), (0.0, 0.5, 10.0)] {
+            let (bite, dropped) = split_damage(d, y, room);
+            assert!(bite >= 0.0 && dropped >= 0.0, "отрицательная доля при {d}/{y}/{room}");
+            assert!(bite <= room, "укус больше, чем вмещает атакующий");
+            assert!((bite + dropped - d).abs() < 1e-6, "сумма долей не равна урону");
+        }
     }
 
     #[test]

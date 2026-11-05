@@ -10,6 +10,7 @@
 mod app;
 mod charts;
 mod colors;
+mod help;
 mod inspector;
 mod worldview;
 

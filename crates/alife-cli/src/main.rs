@@ -116,11 +116,16 @@ fn run() -> Result<(), String> {
             let mut last_report = Instant::now();
             let mut extinct_at = None;
 
+            // Замер обнуляет счётчики интервала, поэтому лишний замер сразу после
+            // предыдущего дал бы строку с нулями во всех метриках событий.
+            let mut sampled_last_tick = false;
             for step in 1..=steps {
                 sim.tick();
+                sampled_last_tick = false;
                 if step % every == 0 || step == steps {
                     let s = sim.sample();
                     csv.write(&s).map_err(|e| format!("{}: {e}", out.display()))?;
+                    sampled_last_tick = true;
                     if last_report.elapsed().as_secs_f64() > 1.0 || step == steps {
                         eprintln!("{}", s.summary());
                         last_report = Instant::now();
@@ -132,8 +137,10 @@ fn run() -> Result<(), String> {
                 }
             }
 
-            let s = sim.sample();
-            csv.write(&s).map_err(|e| format!("{}: {e}", out.display()))?;
+            if !sampled_last_tick {
+                let s = sim.sample();
+                csv.write(&s).map_err(|e| format!("{}: {e}", out.display()))?;
+            }
             csv.flush().map_err(|e| format!("{}: {e}", out.display()))?;
 
             let secs = started.elapsed().as_secs_f64();

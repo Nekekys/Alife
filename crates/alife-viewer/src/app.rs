@@ -7,8 +7,8 @@ use alife_core::{Config, Sample, Sim};
 use eframe::egui::{self, Color32};
 
 use crate::charts::line_chart;
-use crate::inspector;
 use crate::worldview::{ColorMode, WorldView};
+use crate::{help, inspector};
 
 /// Сколько замеров держим для графиков.
 const HISTORY: usize = 1200;
@@ -17,6 +17,13 @@ const HISTORY: usize = 1200;
 struct Selected {
     slot: usize,
     id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Controls,
+    Agent,
+    Help,
 }
 
 pub struct ViewerApp {
@@ -33,6 +40,10 @@ pub struct ViewerApp {
     follow: bool,
     steps_per_sec: f64,
     status: String,
+    tab: Tab,
+    /// Счётчик щелчков по «случайной особи»: на паузе шаг не меняется,
+    /// и без него кнопка возвращала бы одну и ту же особь.
+    pick_counter: u64,
 }
 
 impl ViewerApp {
@@ -53,6 +64,8 @@ impl ViewerApp {
             follow: false,
             steps_per_sec: 0.0,
             status: String::new(),
+            tab: Tab::Controls,
+            pick_counter: 0,
         })
     }
 
@@ -132,8 +145,10 @@ impl ViewerApp {
             self.status = "живых особей нет".into();
             return;
         }
-        // Берём середину списка: не нужен генератор, а слот каждый раз другой.
-        let slot = live[(self.sim.step as usize).wrapping_mul(2654435761) % live.len()];
+        self.pick_counter = self.pick_counter.wrapping_add(1);
+        let mix = (self.sim.step ^ self.pick_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .wrapping_mul(2654435761);
+        let slot = live[(mix % live.len() as u64) as usize];
         self.selected = Some(Selected { slot, id: self.sim.agents.id[slot] });
     }
 
@@ -188,7 +203,14 @@ impl ViewerApp {
             if let Some(s) = self.history.last() {
                 row("в особях", format!("{:.1}%", s.agent_mass_frac * 100.0));
                 row("поколение", format!("{}", s.max_generation));
-                row("убийств/атаку", format!("{:.4}", s.kills_per_attack));
+                row("атак/особь", format!("{:.4}", s.attacks_per_agent));
+                row("попаданий/атаку", format!("{:.4}", s.hits_per_attack));
+                // Единица означает удар наугад, больше — что перед ударом смотрят.
+                let occupancy = s.population as f64 / (self.sim.world.w * self.sim.world.h) as f64;
+                let aim = if occupancy > 0.0 { s.hits_per_attack / occupancy } else { 0.0 };
+                row("наводка", format!("{aim:.2}"));
+                row("убийств/попадание", format!("{:.3}", s.kills_per_hit));
+                row("животной пищи", format!("{:.1}%", s.animal_share * 100.0));
             }
             let drift =
                 (self.sim.total_mass() - self.sim.initial_mass()).abs() / self.sim.initial_mass();
@@ -210,6 +232,9 @@ impl ViewerApp {
         });
         if ui.button("случайная особь").clicked() {
             self.select_random();
+            if self.selected.is_some() {
+                self.tab = Tab::Agent;
+            }
         }
 
         if !self.status.is_empty() {
@@ -217,13 +242,6 @@ impl ViewerApp {
             ui.colored_label(Color32::from_rgb(220, 180, 90), &self.status);
         }
 
-        ui.separator();
-        match self.valid_selection() {
-            Some(slot) => inspector::show(ui, &self.sim, slot),
-            None => {
-                ui.label("щёлкните по особи на карте, чтобы раскрыть её сенсоры и решения");
-            }
-        }
     }
 
     fn charts(&mut self, ui: &mut egui::Ui) {
@@ -231,26 +249,43 @@ impl ViewerApp {
             ui.label("графики появятся после первых замеров");
             return;
         }
+        let cells = (self.sim.world.w * self.sim.world.h) as f64;
         let xs: Vec<f64> = self.history.iter().map(|s| s.step as f64).collect();
         let pop: Vec<f64> = self.history.iter().map(|s| s.population as f64).collect();
         let frac: Vec<f64> = self.history.iter().map(|s| s.agent_mass_frac * 100.0).collect();
         let eats: Vec<f64> = self.history.iter().map(|s| s.eats_per_agent).collect();
-        let kpa: Vec<f64> = self.history.iter().map(|s| s.kills_per_attack).collect();
         let age: Vec<f64> = self.history.iter().map(|s| s.mean_age).collect();
         let plant: Vec<f64> = self.history.iter().map(|s| s.mass_plant).collect();
+        let animal: Vec<f64> = self.history.iter().map(|s| s.animal_share * 100.0).collect();
+        let lethal: Vec<f64> = self.history.iter().map(|s| s.kills_per_hit).collect();
+        // Наводка: попадания сверх того, что дал бы удар наугад при такой плотности.
+        let aim: Vec<f64> = self
+            .history
+            .iter()
+            .map(|s| {
+                let occupancy = s.population as f64 / cells;
+                if occupancy > 0.0 {
+                    s.hits_per_attack / occupancy
+                } else {
+                    0.0
+                }
+            })
+            .collect();
 
         let h = (ui.available_height() - 8.0).max(60.0);
         let row = (h / 2.0 - 4.0).clamp(50.0, 140.0);
-        ui.columns(3, |c| {
+        ui.columns(4, |c| {
             line_chart(&mut c[0], "численность", &xs, &pop, Color32::from_rgb(120, 200, 255), row);
             line_chart(&mut c[1], "биомасса в особях, %", &xs, &frac, Color32::from_rgb(150, 230, 150), row);
             line_chart(&mut c[2], "средний возраст", &xs, &age, Color32::from_rgb(230, 200, 120), row);
+            line_chart(&mut c[3], "растительная масса", &xs, &plant, Color32::from_rgb(120, 220, 160), row);
         });
         ui.add_space(4.0);
-        ui.columns(3, |c| {
-            line_chart(&mut c[0], "растительная масса", &xs, &plant, Color32::from_rgb(120, 220, 160), row);
-            line_chart(&mut c[1], "еда на особь за шаг", &xs, &eats, Color32::from_rgb(200, 170, 255), row);
-            line_chart(&mut c[2], "убийств на атаку", &xs, &kpa, Color32::from_rgb(255, 130, 130), row);
+        ui.columns(4, |c| {
+            line_chart(&mut c[0], "еда на особь за шаг", &xs, &eats, Color32::from_rgb(200, 170, 255), row);
+            line_chart(&mut c[1], "животная пища, %", &xs, &animal, Color32::from_rgb(255, 150, 120), row);
+            line_chart(&mut c[2], "наводка (1 = вслепую)", &xs, &aim, Color32::from_rgb(255, 210, 120), row);
+            line_chart(&mut c[3], "убийств на попадание", &xs, &lethal, Color32::from_rgb(255, 130, 130), row);
         });
     }
 }
@@ -277,7 +312,24 @@ impl eframe::App for ViewerApp {
             .default_size(360.0)
             .resizable(true)
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Controls, "управление");
+                    ui.selectable_value(&mut self.tab, Tab::Agent, "особь");
+                    ui.selectable_value(&mut self.tab, Tab::Help, "что происходит");
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
+                    Tab::Controls => self.controls(ui),
+                    Tab::Agent => match self.valid_selection() {
+                        Some(slot) => inspector::show(ui, &self.sim, slot),
+                        None => {
+                            ui.label(
+                                "щёлкните по особи на карте, чтобы раскрыть её сенсоры и решения",
+                            );
+                        }
+                    },
+                    Tab::Help => help::show(ui, &self.sim),
+                });
             });
 
         egui::Panel::bottom("charts")
@@ -286,6 +338,10 @@ impl eframe::App for ViewerApp {
             .show(ui, |ui| self.charts(ui));
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            egui::Panel::bottom("legend")
+                .exact_size(22.0)
+                .show(ui, |ui| help::legend(ui, self.view.mode));
+
             let max_gen = self.history.last().map_or(1, |s| s.max_generation);
             self.view.refresh(ui.ctx(), &self.sim, max_gen);
 
@@ -302,6 +358,7 @@ impl eframe::App for ViewerApp {
                 match self.sim.agent_at(x, y) {
                     Some(slot) => {
                         self.selected = Some(Selected { slot, id: self.sim.agents.id[slot] });
+                        self.tab = Tab::Agent;
                         self.status.clear();
                     }
                     None => self.status = format!("в клетке {x}, {y} пусто"),
