@@ -1,0 +1,15 @@
+[package]
+name = "alife-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "alife"
+path = "src/main.rs"
+
+[dependencies]
+alife-core = { path = "../alife-core" }
+clap = { workspace = true }
+toml = { workspace = true }
+rayon = { workspace = true }

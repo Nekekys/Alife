@@ -1,0 +1,9 @@
+[package]
+name = "alife-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+rayon = { workspace = true }
