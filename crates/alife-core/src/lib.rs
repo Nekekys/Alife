@@ -23,5 +23,5 @@ pub mod world;
 
 pub use config::Config;
 pub use metrics::{CsvWriter, Sample};
-pub use sim::Sim;
+pub use sim::{Action, Inspection, Sim};
 pub use world::World;

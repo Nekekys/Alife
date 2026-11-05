@@ -7,6 +7,18 @@ use crate::rng::Rng;
 /// Выходы сети: [стоять, север, юг, запад, восток, есть, атаковать, размножиться].
 pub const N_OUTPUTS: usize = 8;
 
+/// Названия выходов в том же порядке — для инспектора особи.
+pub const OUTPUT_NAMES: [&str; N_OUTPUTS] = [
+    "стоять",
+    "север",
+    "юг",
+    "запад",
+    "восток",
+    "есть",
+    "атаковать",
+    "размножиться",
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct Layer {
     pub w_off: usize,

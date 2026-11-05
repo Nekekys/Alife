@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/alife-core", "crates/alife-cli"]
+members = ["crates/alife-core", "crates/alife-cli", "crates/alife-viewer"]
 
 [workspace.package]
 version = "0.1.0"

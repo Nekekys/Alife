@@ -25,6 +25,14 @@ pub struct Action {
     pub repro: bool,
 }
 
+/// Снимок «мышления» одной особи: что она видит и что решает.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub inputs: Vec<f32>,
+    pub outputs: Vec<f32>,
+    pub action: Action,
+}
+
 #[derive(Debug)]
 pub struct Sim {
     pub cfg: Config,
@@ -376,6 +384,37 @@ impl Sim {
         sample
     }
 
+    /// Кто стоит в клетке. Нужно просмотрщику, чтобы выбрать особь по щелчку.
+    pub fn agent_at(&self, x: usize, y: usize) -> Option<usize> {
+        if x >= self.world.w || y >= self.world.h {
+            return None;
+        }
+        match self.world.occupant[self.world.idx(x, y)] {
+            NO_AGENT => None,
+            slot => Some(slot as usize),
+        }
+    }
+
+    /// Пересчитывает входы и выходы сети для одной особи.
+    ///
+    /// Это ровно то же, что делает параллельная фаза шага, но для одного слота
+    /// и без побочных эффектов: тихий баг в сенсорах иначе не отличить
+    /// от «эволюция просто идёт медленно».
+    pub fn inspect(&self, slot: usize) -> Option<Inspection> {
+        if slot >= self.agents.capacity || !self.agents.alive[slot] {
+            return None;
+        }
+        let mut inputs = vec![0.0f32; self.brain.n_in];
+        sense(&self.world, &self.agents, slot, &self.sensor, &self.scales, &mut inputs);
+        let mut scratch = Scratch::new(self.brain.max_width);
+        let outputs = self
+            .brain
+            .forward(self.agents.genome(slot), &inputs, &mut scratch)
+            .to_vec();
+        let action = decode_action(&outputs);
+        Some(Inspection { inputs, outputs, action })
+    }
+
     /// Отпечаток полного состояния: им проверяется воспроизводимость прогонов.
     pub fn state_hash(&self) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -487,6 +526,37 @@ mod tests {
             b.tick();
         }
         assert_ne!(a.state_hash(), b.state_hash());
+    }
+
+    #[test]
+    fn inspection_predicts_the_next_move() {
+        // Одна особь в пустом мире: ей никто не мешает, поэтому предсказанное
+        // инспектором перемещение должно совпасть с фактическим.
+        let mut cfg = small_cfg();
+        cfg.world.init_agents = 1;
+        let mut sim = Sim::new(cfg).unwrap();
+        let slot = (0..sim.agents.capacity).find(|&i| sim.agents.alive[i]).unwrap();
+
+        let before = (sim.agents.x[slot], sim.agents.y[slot]);
+        let ins = sim.inspect(slot).unwrap();
+        assert_eq!(ins.inputs.len(), sim.brain.n_in);
+        assert_eq!(ins.outputs.len(), N_OUTPUTS);
+
+        let expected = if ins.action.attack || !ins.action.mv {
+            before
+        } else {
+            sim.world.step_wrap(before.0, before.1, ins.action.facing)
+        };
+        sim.tick();
+        assert_eq!((sim.agents.x[slot], sim.agents.y[slot]), expected);
+    }
+
+    #[test]
+    fn inspection_of_an_empty_slot_is_none() {
+        let sim = Sim::new(small_cfg()).unwrap();
+        let empty = (0..sim.agents.capacity).find(|&i| !sim.agents.alive[i]).unwrap();
+        assert!(sim.inspect(empty).is_none());
+        assert!(sim.inspect(sim.agents.capacity).is_none());
     }
 
     #[test]

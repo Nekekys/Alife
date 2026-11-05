@@ -1,0 +1,14 @@
+[package]
+name = "alife-viewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "alife-viewer"
+path = "src/main.rs"
+
+[dependencies]
+alife-core = { path = "../alife-core" }
+eframe = "0.37"
+toml = { workspace = true }
