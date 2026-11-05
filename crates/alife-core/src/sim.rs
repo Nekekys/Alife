@@ -52,6 +52,8 @@ pub struct Sim {
     pub projector: Projector,
     live_idx: Vec<u32>,
     actions: Vec<Action>,
+    /// Новая память, посчитанная параллельно и записываемая обратно по порядку.
+    states: Vec<f32>,
     initial_mass: f64,
 }
 
@@ -60,10 +62,15 @@ impl Sim {
         cfg.validate()?;
 
         let sensor = SensorSpec::new(cfg.brain.vision_radius);
-        let brain = BrainSpec::new(sensor.n_inputs(), &cfg.brain.hidden, N_OUTPUTS);
+        let brain = BrainSpec::new(
+            sensor.n_inputs(),
+            &cfg.brain.hidden,
+            N_OUTPUTS,
+            cfg.brain.recurrent,
+        );
         let scales = Scales::from_config(&cfg);
         let mut world = World::new(cfg.world.width, cfg.world.height);
-        let mut agents = Agents::new(cfg.world.capacity, brain.genome_len);
+        let mut agents = Agents::new(cfg.world.capacity, brain.genome_len, brain.memory);
         let mut rng = Rng::new(cfg.seed);
 
         let cells = world.cells();
@@ -127,6 +134,7 @@ impl Sim {
             projector: Projector::new(brain_genome_len, GENETIC_DIM, cfg_seed ^ 0x5EED),
             live_idx: Vec::new(),
             actions: Vec::new(),
+            states: Vec::new(),
             initial_mass: 0.0,
         };
         sim.initial_mass = sim.total_mass();
@@ -136,6 +144,7 @@ impl Sim {
     pub fn tick(&mut self) {
         self.collect_live();
         self.decide();
+        self.store_states();
         self.act();
         let res = self.cfg.resources.clone();
         self.world.update(&res);
@@ -183,7 +192,7 @@ impl Sim {
 
     /// Параллельная часть шага: мир здесь только читается.
     fn decide(&mut self) {
-        let Sim { world, agents, brain, sensor, scales, live_idx, actions, .. } = self;
+        let Sim { world, agents, brain, sensor, scales, live_idx, actions, states, .. } = self;
         let world: &World = world;
         let agents: &Agents = agents;
         let brain: &BrainSpec = brain;
@@ -194,15 +203,48 @@ impl Sim {
         actions.clear();
         actions.resize(live.len(), Action::default());
 
-        actions.par_iter_mut().enumerate().for_each_init(
-            || (Scratch::new(brain.max_width), vec![0.0f32; brain.n_in]),
-            |(scratch, input), (k, act)| {
-                let i = live[k] as usize;
-                sense(world, agents, i, sensor, scales, input);
-                let out = brain.forward(agents.genome(i), input, scratch);
-                *act = decode_action(out);
-            },
-        );
+        let mem = brain.memory;
+        // Память пишется в отдельный буфер: мир в этой фазе только читается,
+        // а порядок записи обратно должен остаться предсказуемым.
+        let chunk = mem.max(1);
+        states.clear();
+        states.resize(live.len() * chunk, 0.0);
+        let n_sensors = brain.n_sensors;
+
+        actions
+            .par_iter_mut()
+            .zip(states.par_chunks_mut(chunk))
+            .enumerate()
+            .for_each_init(
+                || (Scratch::new(brain.max_width), vec![0.0f32; brain.n_in]),
+                |(scratch, input), (k, (act, state))| {
+                    let i = live[k] as usize;
+                    sense(world, agents, i, sensor, scales, &mut input[..n_sensors]);
+                    if mem > 0 {
+                        input[n_sensors..].copy_from_slice(agents.memory(i));
+                    }
+                    let out = brain.forward(
+                        agents.genome(i),
+                        input,
+                        scratch,
+                        (mem > 0).then_some(&mut state[..mem]),
+                    );
+                    *act = decode_action(out);
+                },
+            );
+    }
+
+    /// Переносит посчитанную память в особей, по возрастанию слота.
+    fn store_states(&mut self) {
+        let mem = self.brain.memory;
+        if mem == 0 {
+            return;
+        }
+        for (k, &slot) in self.live_idx.iter().enumerate() {
+            let src = &self.states[k * mem..(k + 1) * mem];
+            self.agents.memories[slot as usize * mem..(slot as usize + 1) * mem]
+                .copy_from_slice(src);
+        }
     }
 
     /// Последовательная часть шага: порядок применения действий — по слотам.
@@ -459,11 +501,22 @@ impl Sim {
             return None;
         }
         let mut inputs = vec![0.0f32; self.brain.n_in];
-        sense(&self.world, &self.agents, slot, &self.sensor, &self.scales, &mut inputs);
+        let n_sensors = self.brain.n_sensors;
+        sense(
+            &self.world,
+            &self.agents,
+            slot,
+            &self.sensor,
+            &self.scales,
+            &mut inputs[..n_sensors],
+        );
+        if self.brain.memory > 0 {
+            inputs[n_sensors..].copy_from_slice(self.agents.memory(slot));
+        }
         let mut scratch = Scratch::new(self.brain.max_width);
         let outputs = self
             .brain
-            .forward(self.agents.genome(slot), &inputs, &mut scratch)
+            .forward(self.agents.genome(slot), &inputs, &mut scratch, None)
             .to_vec();
         let action = decode_action(&outputs);
         Some(Inspection { inputs, outputs, action })
@@ -597,6 +650,9 @@ impl Sim {
             h = fnv(h, self.agents.y[i] as u64);
             h = fnv(h, self.agents.energy[i].to_bits() as u64);
             h = fnv(h, self.agents.age[i] as u64);
+            for v in self.agents.memory(i) {
+                h = fnv(h, v.to_bits() as u64);
+            }
         }
         for i in 0..self.world.cells() {
             h = fnv(h, self.world.plant[i].to_bits() as u64);
@@ -807,6 +863,52 @@ mod tests {
         assert!(g.mean_distance < 100.0, "родня разошлась на {} шагов", g.mean_distance);
         assert!(g.p10_distance <= g.median_distance);
         assert!(g.median_distance <= g.p90_distance);
+    }
+
+    #[test]
+    fn memory_is_deterministic_and_bounded() {
+        let mut cfg = small_cfg();
+        cfg.brain.recurrent = true;
+        let mut a = Sim::new(cfg.clone()).unwrap();
+        let mut b = Sim::new(cfg).unwrap();
+        assert!(a.brain.memory > 0, "рекуррентный слой не включился");
+        for _ in 0..300 {
+            a.tick();
+            b.tick();
+        }
+        assert_eq!(a.state_hash(), b.state_hash(), "память сломала воспроизводимость");
+        // Память снимается после tanh, значит обязана лежать в пределах ±1.
+        for i in 0..a.agents.capacity {
+            if !a.agents.alive[i] {
+                continue;
+            }
+            assert!(
+                a.agents.memory(i).iter().all(|v| v.abs() <= 1.0 && v.is_finite()),
+                "память вышла за пределы у слота {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_newborn_starts_with_empty_memory() {
+        let mut cfg = small_cfg();
+        cfg.brain.recurrent = true;
+        let mut sim = Sim::new(cfg).unwrap();
+        for _ in 0..200 {
+            sim.tick();
+        }
+        // Слот, занятый только что родившейся особью, не должен нести
+        // память предыдущего хозяина слота.
+        let newborn = (0..sim.agents.capacity)
+            .find(|&i| sim.agents.alive[i] && sim.agents.age[i] == 0);
+        if let Some(i) = newborn {
+            // Память записывается в следующей фазе, значит сразу после
+            // рождения она ещё нулевая.
+            assert!(
+                sim.agents.memory(i).iter().all(|v| *v == 0.0),
+                "новорождённый унаследовал чужую память"
+            );
+        }
     }
 
     #[test]

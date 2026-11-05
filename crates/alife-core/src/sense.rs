@@ -120,8 +120,9 @@ mod tests {
         let cfg = Config::default();
         let world = World::new(16, 16);
         let spec = SensorSpec::new(cfg.brain.vision_radius);
-        let brain = BrainSpec::new(spec.n_inputs(), &cfg.brain.hidden, crate::brain::N_OUTPUTS);
-        let agents = Agents::new(8, brain.genome_len);
+        let brain =
+            BrainSpec::new(spec.n_inputs(), &cfg.brain.hidden, crate::brain::N_OUTPUTS, false);
+        let agents = Agents::new(8, brain.genome_len, 0);
         (world, agents, cfg)
     }
 

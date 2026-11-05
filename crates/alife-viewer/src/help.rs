@@ -6,25 +6,43 @@
 use alife_core::Sim;
 use eframe::egui::{self, Color32, Sense, Vec2};
 
-use crate::colors::cell_color;
+use crate::colors::{cell_color, diet_color};
 use crate::worldview::ColorMode;
 
 /// Компактная легенда под картой: что означают цвета прямо сейчас.
-pub fn legend(ui: &mut egui::Ui, mode: ColorMode) {
+pub fn legend(ui: &mut egui::Ui, mode: ColorMode, resources: bool, agents: bool) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        swatch(ui, cell_color(0.9, 0.0, 0.2), "растения");
-        swatch(ui, cell_color(0.0, 0.9, 0.2), "падаль");
-        swatch(ui, cell_color(0.0, 0.0, 1.0), "питательные вещества");
-        swatch(ui, cell_color(0.0, 0.0, 0.0), "пусто");
-        ui.separator();
-        ui.small(match mode {
-            ColorMode::Lineage => "особи: цвет по линии — родственники одного оттенка",
-            ColorMode::Energy => "особи: от синего к белому по энергии",
-            ColorMode::Age => "особи: от синего к белому по возрасту",
-            ColorMode::Generation => "особи: от синего к белому по поколению",
-            ColorMode::ResourcesOnly => "особи не показаны",
-        });
+        if resources {
+            swatch(ui, cell_color(0.9, 0.0, 0.2), "растения");
+            swatch(ui, cell_color(0.0, 0.9, 0.2), "падаль");
+            swatch(ui, cell_color(0.0, 0.0, 1.0), "питательные вещества");
+            swatch(ui, cell_color(0.0, 0.0, 0.0), "пусто");
+            ui.separator();
+        }
+        if !agents {
+            ui.small("особи не показаны");
+            return;
+        }
+        match mode {
+            ColorMode::Diet => {
+                swatch(ui, diet_color(1.0, 0.0, 0.0), "травоядная");
+                swatch(ui, diet_color(0.0, 1.0, 0.0), "хищная");
+                swatch(ui, diet_color(0.0, 0.0, 1.0), "съела мало, судить рано");
+            }
+            ColorMode::Lineage => {
+                ui.small("особи: цвет по линии — родственники одного оттенка");
+            }
+            ColorMode::Energy => {
+                ui.small("особи: от синего к белому по энергии");
+            }
+            ColorMode::Age => {
+                ui.small("особи: от синего к белому по возрасту");
+            }
+            ColorMode::Generation => {
+                ui.small("особи: от синего к белому по поколению");
+            }
+        }
     });
 }
 

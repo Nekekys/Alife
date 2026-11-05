@@ -28,13 +28,17 @@ pub struct Agents {
     /// Съедено за жизнь животной: укусы и падаль вместе.
     pub eaten_animal: Vec<f32>,
     pub genomes: Vec<f32>,
+    /// Длина памяти одной особи; 0 у сети без рекуррентного слоя.
+    pub memory_len: usize,
+    /// Состояние между шагами, подряд по `memory_len` чисел на особь.
+    pub memories: Vec<f32>,
     free: Vec<u32>,
     live: usize,
     next_id: u64,
 }
 
 impl Agents {
-    pub fn new(capacity: usize, genome_len: usize) -> Self {
+    pub fn new(capacity: usize, genome_len: usize, memory_len: usize) -> Self {
         let mut free: Vec<u32> = Vec::with_capacity(capacity);
         // В обратном порядке: слоты раздаются по возрастанию индекса.
         for i in (0..capacity).rev() {
@@ -57,6 +61,8 @@ impl Agents {
             eaten_plant: vec![0.0; capacity],
             eaten_animal: vec![0.0; capacity],
             genomes: vec![0.0; capacity * genome_len],
+            memory_len,
+            memories: vec![0.0; capacity * memory_len],
             free,
             live: 0,
             next_id: 1,
@@ -78,6 +84,18 @@ impl Agents {
     pub fn genome_mut(&mut self, slot: usize) -> &mut [f32] {
         let o = slot * self.genome_len;
         &mut self.genomes[o..o + self.genome_len]
+    }
+
+    #[inline]
+    pub fn memory(&self, slot: usize) -> &[f32] {
+        let o = slot * self.memory_len;
+        &self.memories[o..o + self.memory_len]
+    }
+
+    #[inline]
+    pub fn memory_mut(&mut self, slot: usize) -> &mut [f32] {
+        let o = slot * self.memory_len;
+        &mut self.memories[o..o + self.memory_len]
     }
 
     pub fn copy_genome(&mut self, src: usize, dst: usize) {
@@ -112,6 +130,8 @@ impl Agents {
         self.last_hit[slot] = 0.0;
         self.eaten_plant[slot] = 0.0;
         self.eaten_animal[slot] = 0.0;
+        // Потомок начинает с чистой памятью: наследуется сеть, а не состояние.
+        self.memory_mut(slot).fill(0.0);
         let id = self.next_id;
         self.next_id += 1;
         self.id[slot] = id;
@@ -139,7 +159,7 @@ mod tests {
 
     #[test]
     fn slots_are_reused_in_order() {
-        let mut a = Agents::new(4, 2);
+        let mut a = Agents::new(4, 2, 0);
         let s0 = a.alloc().unwrap();
         let s1 = a.alloc().unwrap();
         assert_eq!((s0, s1), (0, 1));
@@ -153,7 +173,7 @@ mod tests {
 
     #[test]
     fn capacity_runs_out() {
-        let mut a = Agents::new(2, 1);
+        let mut a = Agents::new(2, 1, 0);
         assert!(a.alloc().is_some());
         assert!(a.alloc().is_some());
         assert!(a.alloc().is_none());
@@ -161,7 +181,7 @@ mod tests {
 
     #[test]
     fn copy_genome_duplicates_weights() {
-        let mut a = Agents::new(2, 3);
+        let mut a = Agents::new(2, 3, 0);
         a.genome_mut(0).copy_from_slice(&[1.0, 2.0, 3.0]);
         a.copy_genome(0, 1);
         assert_eq!(a.genome(1), &[1.0, 2.0, 3.0]);

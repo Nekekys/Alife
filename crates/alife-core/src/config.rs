@@ -62,11 +62,15 @@ pub struct BrainConfig {
     pub vision_radius: usize,
     /// Размеры скрытых слоёв.
     pub hidden: Vec<usize>,
+    /// Возвращать ли выходы последнего скрытого слоя на вход следующего шага.
+    /// Это даёт особи память между шагами: без неё она каждый раз
+    /// решает заново, зная только то, что видит сейчас.
+    pub recurrent: bool,
 }
 
 impl Default for BrainConfig {
     fn default() -> Self {
-        Self { vision_radius: 3, hidden: vec![32, 32] }
+        Self { vision_radius: 3, hidden: vec![32, 32], recurrent: false }
     }
 }
 

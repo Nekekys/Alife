@@ -48,3 +48,18 @@ pub fn hsv(h: f32, s: f32, v: f32) -> Color32 {
     };
     Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
 }
+
+/// Цвет по рациону: зелёный — травоядная, красный — хищная, серый — пока
+/// съедено слишком мало, чтобы судить.
+pub fn diet_color(plant: f32, animal: f32, min_intake: f32) -> Color32 {
+    let total = plant + animal;
+    if total < min_intake {
+        return Color32::from_gray(90);
+    }
+    let meat = (animal / total).clamp(0.0, 1.0);
+    Color32::from_rgb(
+        (60.0 + meat * 195.0) as u8,
+        (60.0 + (1.0 - meat) * 195.0) as u8,
+        60,
+    )
+}

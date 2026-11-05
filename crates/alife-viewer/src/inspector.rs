@@ -95,6 +95,17 @@ pub fn show(ui: &mut egui::Ui, sim: &Sim, slot: usize) {
         }
     });
 
+    if sim.brain.memory > 0 {
+        ui.add_space(4.0);
+        ui.label(format!("память между шагами ({} чисел)", sim.brain.memory));
+        memory_strip(ui, sim.agents.memory(slot));
+        ui.small(
+            "Выходы последнего скрытого слоя с прошлого шага, возвращённые на вход. \
+             Они лежат в пределах ±1. У новорождённой особи память пустая: \
+             наследуется сеть, а не состояние.",
+        );
+    }
+
     ui.add_space(4.0);
     let scalars_at = sim.sensor.side * sim.sensor.side * CHANNELS;
     egui::Grid::new("scalars")
@@ -191,4 +202,42 @@ fn channel_grid(ui: &mut egui::Ui, name: &str, inputs: &[f32], side: usize, chan
             egui::StrokeKind::Inside,
         );
     });
+}
+
+/// Память одной особи полоской: вверх от середины — плюс, вниз — минус.
+fn memory_strip(ui: &mut egui::Ui, memory: &[f32]) {
+    if memory.is_empty() {
+        return;
+    }
+    let width = ui.available_width().min(260.0);
+    let height = 28.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 1.0, ui.visuals().extreme_bg_color);
+
+    let mid = rect.center().y;
+    painter.line_segment(
+        [egui::pos2(rect.min.x, mid), egui::pos2(rect.max.x, mid)],
+        Stroke::new(1.0, ui.visuals().weak_text_color()),
+    );
+
+    let step = rect.width() / memory.len() as f32;
+    let half = (height - 4.0) * 0.5;
+    for (i, v) in memory.iter().enumerate() {
+        let x = rect.min.x + i as f32 * step;
+        let h = v.clamp(-1.0, 1.0) * half;
+        let color = if *v >= 0.0 {
+            Color32::from_rgb(120, 200, 150)
+        } else {
+            Color32::from_rgb(220, 140, 120)
+        };
+        painter.rect_filled(
+            Rect::from_min_max(
+                egui::pos2(x, mid.min(mid - h)),
+                egui::pos2(x + (step - 1.0).max(1.0), mid.max(mid - h)),
+            ),
+            0.0,
+            color,
+        );
+    }
 }

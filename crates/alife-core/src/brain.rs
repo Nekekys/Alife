@@ -29,6 +29,10 @@ pub struct Layer {
 
 #[derive(Debug, Clone)]
 pub struct BrainSpec {
+    /// Сколько входов даёт сенсор; остальное — возвращённая память.
+    pub n_sensors: usize,
+    /// Длина памяти между шагами; 0 означает сеть без памяти.
+    pub memory: usize,
     pub n_in: usize,
     pub n_out: usize,
     pub layers: Vec<Layer>,
@@ -37,7 +41,11 @@ pub struct BrainSpec {
 }
 
 impl BrainSpec {
-    pub fn new(n_in: usize, hidden: &[usize], n_out: usize) -> Self {
+    /// `recurrent` подаёт на вход следующего шага выходы последнего скрытого
+    /// слоя. Это сеть Элмана: памяти ровно столько, сколько в этом слое нейронов.
+    pub fn new(n_sensors: usize, hidden: &[usize], n_out: usize, recurrent: bool) -> Self {
+        let memory = if recurrent { hidden.last().copied().unwrap_or(0) } else { 0 };
+        let n_in = n_sensors + memory;
         let mut layers = Vec::with_capacity(hidden.len() + 1);
         let mut off = 0usize;
         let mut prev = n_in;
@@ -56,7 +64,7 @@ impl BrainSpec {
         let b_off = off;
         off += n_out;
         layers.push(Layer { w_off, b_off, n_in: prev, n_out });
-        Self { n_in, n_out, layers, genome_len: off, max_width }
+        Self { n_sensors, memory, n_in, n_out, layers, genome_len: off, max_width }
     }
 
     /// Случайный геном: веса N(0, 1/sqrt(n_in)), смещения нулевые.
@@ -72,7 +80,17 @@ impl BrainSpec {
     }
 
     /// Прямой проход. Результат остаётся в буфере `s` и возвращается срезом.
-    pub fn forward<'a>(&self, g: &[f32], input: &[f32], s: &'a mut Scratch) -> &'a [f32] {
+    ///
+    /// `state_out`, если задан, получает выходы последнего скрытого слоя —
+    /// это и есть память, которую сеть увидит на следующем шаге. Она лежит
+    /// в пределах ±1, потому что снимается уже после tanh.
+    pub fn forward<'a>(
+        &self,
+        g: &[f32],
+        input: &[f32],
+        s: &'a mut Scratch,
+        mut state_out: Option<&mut [f32]>,
+    ) -> &'a [f32] {
         debug_assert_eq!(input.len(), self.n_in);
         s.a.clear();
         s.a.extend_from_slice(input);
@@ -86,6 +104,11 @@ impl BrainSpec {
             if i != last {
                 for v in s.b.iter_mut() {
                     *v = tanh_approx(*v);
+                }
+                if i + 1 == last {
+                    if let Some(st) = state_out.as_deref_mut() {
+                        st.copy_from_slice(&s.b);
+                    }
                 }
             }
             std::mem::swap(&mut s.a, &mut s.b);
@@ -136,9 +159,63 @@ mod tests {
 
     #[test]
     fn genome_layout_is_contiguous() {
-        let spec = BrainSpec::new(10, &[4, 3], 2);
+        let spec = BrainSpec::new(10, &[4, 3], 2, false);
         assert_eq!(spec.genome_len, 10 * 4 + 4 + 4 * 3 + 3 + 3 * 2 + 2);
         assert_eq!(spec.max_width, 10);
+        assert_eq!(spec.memory, 0);
+    }
+
+    #[test]
+    fn recurrence_widens_the_input_by_the_last_hidden_layer() {
+        let plain = BrainSpec::new(10, &[4, 3], 2, false);
+        let rec = BrainSpec::new(10, &[4, 3], 2, true);
+        assert_eq!(rec.memory, 3, "память равна размеру последнего скрытого слоя");
+        assert_eq!(rec.n_in, 13);
+        assert_eq!(rec.n_sensors, 10);
+        // Шире только первый слой, остальные не меняются.
+        assert_eq!(rec.genome_len - plain.genome_len, 3 * 4);
+    }
+
+    #[test]
+    fn state_comes_from_the_last_hidden_layer() {
+        let spec = BrainSpec::new(6, &[5, 4], N_OUTPUTS, true);
+        let mut rng = Rng::new(3);
+        let mut g = vec![0.0; spec.genome_len];
+        spec.random_genome(&mut rng, &mut g);
+        let mut s = Scratch::new(spec.max_width);
+        let mut state = vec![0.0f32; spec.memory];
+        let input = vec![0.3f32; spec.n_in];
+        let out = spec.forward(&g, &input, &mut s, Some(&mut state));
+        assert_eq!(out.len(), N_OUTPUTS);
+        assert_eq!(state.len(), 4);
+        // Память снимается после tanh, поэтому не может выйти за ±1.
+        assert!(state.iter().all(|v| v.abs() <= 1.0), "память вышла за пределы: {state:?}");
+        assert!(state.iter().any(|v| *v != 0.0), "память осталась нулевой");
+    }
+
+    #[test]
+    fn memory_changes_what_the_network_answers() {
+        let spec = BrainSpec::new(6, &[5, 4], N_OUTPUTS, true);
+        let mut rng = Rng::new(11);
+        let mut g = vec![0.0; spec.genome_len];
+        spec.random_genome(&mut rng, &mut g);
+        let mut s = Scratch::new(spec.max_width);
+
+        let mut a = vec![0.5f32; spec.n_in];
+        let mut b = a.clone();
+        // Те же сенсоры, разная память.
+        for v in &mut a[spec.n_sensors..] {
+            *v = -1.0;
+        }
+        for v in &mut b[spec.n_sensors..] {
+            *v = 1.0;
+        }
+        let out_a = spec.forward(&g, &a, &mut s, None).to_vec();
+        let out_b = spec.forward(&g, &b, &mut s, None).to_vec();
+        assert!(
+            out_a.iter().zip(&out_b).any(|(x, y)| (x - y).abs() > 1e-6),
+            "память не влияет на ответ"
+        );
     }
 
     #[test]
@@ -151,12 +228,12 @@ mod tests {
 
     #[test]
     fn forward_runs_and_stays_finite() {
-        let spec = BrainSpec::new(6, &[5, 5], N_OUTPUTS);
+        let spec = BrainSpec::new(6, &[5, 5], N_OUTPUTS, false);
         let mut rng = Rng::new(7);
         let mut g = vec![0.0; spec.genome_len];
         spec.random_genome(&mut rng, &mut g);
         let mut s = Scratch::new(spec.max_width);
-        let out = spec.forward(&g, &[0.5; 6], &mut s);
+        let out = spec.forward(&g, &[0.5; 6], &mut s, None);
         assert_eq!(out.len(), N_OUTPUTS);
         assert!(out.iter().all(|v| v.is_finite()));
     }

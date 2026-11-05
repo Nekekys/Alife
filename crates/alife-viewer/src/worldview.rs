@@ -5,7 +5,7 @@ use alife_core::world::NO_AGENT;
 use alife_core::Sim;
 use eframe::egui::{self, Color32, ColorImage, Pos2, Rect, Response, Sense, TextureHandle, Vec2};
 
-use crate::colors::{cell_color, heat, lineage_color};
+use crate::colors::{cell_color, diet_color, heat, lineage_color};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorMode {
@@ -13,7 +13,7 @@ pub enum ColorMode {
     Energy,
     Age,
     Generation,
-    ResourcesOnly,
+    Diet,
 }
 
 impl ColorMode {
@@ -22,7 +22,7 @@ impl ColorMode {
         (ColorMode::Energy, "энергия"),
         (ColorMode::Age, "возраст"),
         (ColorMode::Generation, "поколение"),
-        (ColorMode::ResourcesOnly, "только ресурсы"),
+        (ColorMode::Diet, "рацион"),
     ];
 }
 
@@ -30,6 +30,9 @@ pub struct WorldView {
     texture: Option<TextureHandle>,
     pixels: Vec<Color32>,
     pub mode: ColorMode,
+    /// Рисовать ли ресурсы фоном. Без них видно одних существ.
+    pub show_resources: bool,
+    pub show_agents: bool,
     /// Пикселей на клетку.
     pub scale: f32,
     /// Клетка мира в левом верхнем углу области просмотра.
@@ -43,6 +46,8 @@ impl Default for WorldView {
             texture: None,
             pixels: Vec::new(),
             mode: ColorMode::Lineage,
+            show_resources: true,
+            show_agents: true,
             scale: 3.0,
             origin: Vec2::ZERO,
             fitted: false,
@@ -58,17 +63,23 @@ impl WorldView {
         let scales = Scales::from_config(&sim.cfg);
         self.pixels.resize(w * h, Color32::BLACK);
 
-        for i in 0..w * h {
-            self.pixels[i] = cell_color(
-                sim.world.plant[i] * scales.inv_plant,
-                sim.world.carrion[i] * scales.inv_carrion,
-                sim.world.nutrient[i] * scales.inv_nutrient,
-            );
+        if self.show_resources {
+            for i in 0..w * h {
+                self.pixels[i] = cell_color(
+                    sim.world.plant[i] * scales.inv_plant,
+                    sim.world.carrion[i] * scales.inv_carrion,
+                    sim.world.nutrient[i] * scales.inv_nutrient,
+                );
+            }
+        } else {
+            // Чистый вид: без фона каждая особь видна сама по себе.
+            self.pixels.iter_mut().for_each(|p| *p = Color32::from_gray(6));
         }
 
-        if self.mode != ColorMode::ResourcesOnly {
+        if self.show_agents {
             let max_energy = sim.cfg.agent.max_energy.max(1e-6);
             let gen_span = max_generation.max(1) as f32;
+            let min_intake = sim.cfg.agent.birth_energy;
             for i in 0..w * h {
                 let occ = sim.world.occupant[i];
                 if occ == NO_AGENT {
@@ -81,7 +92,11 @@ impl WorldView {
                     // 1000 шагов — тот же масштаб, в котором возраст видит сама особь.
                     ColorMode::Age => heat(sim.agents.age[slot] as f32 / 1000.0),
                     ColorMode::Generation => heat(sim.agents.generation[slot] as f32 / gen_span),
-                    ColorMode::ResourcesOnly => unreachable!(),
+                    ColorMode::Diet => diet_color(
+                        sim.agents.eaten_plant[slot],
+                        sim.agents.eaten_animal[slot],
+                        min_intake,
+                    ),
                 };
             }
         }

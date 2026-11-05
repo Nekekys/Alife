@@ -226,6 +226,15 @@ impl ViewerApp {
         });
 
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("показывать");
+            ui.checkbox(&mut self.view.show_resources, "ресурсы");
+            ui.checkbox(&mut self.view.show_agents, "особей");
+            if ui.button("только существа").clicked() {
+                self.view.show_resources = false;
+                self.view.show_agents = true;
+            }
+        });
         ui.label("раскраска особей");
         ui.horizontal_wrapped(|ui| {
             for (mode, name) in ColorMode::ALL {
@@ -355,7 +364,9 @@ impl eframe::App for ViewerApp {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Panel::bottom("legend")
                 .exact_size(22.0)
-                .show(ui, |ui| help::legend(ui, self.view.mode));
+                .show(ui, |ui| {
+                    help::legend(ui, self.view.mode, self.view.show_resources, self.view.show_agents)
+                });
 
             let max_gen = self.history.last().map_or(1, |s| s.max_generation);
             self.view.refresh(ui.ctx(), &self.sim, max_gen);
