@@ -70,7 +70,7 @@ pub struct BrainConfig {
 
 impl Default for BrainConfig {
     fn default() -> Self {
-        Self { vision_radius: 3, hidden: vec![32, 32], recurrent: false }
+        Self { vision_radius: 3, hidden: vec![32, 32], recurrent: true }
     }
 }
 

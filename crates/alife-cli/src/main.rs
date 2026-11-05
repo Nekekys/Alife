@@ -302,23 +302,28 @@ fn report_dynamics(population: &[f64], herbivores: &[f64], predators: &[f64], ev
     eprintln!("зеркальность долей хищных и травоядных: {mirror:.2}");
 
     let (lag, corr) = alife_core::best_lag(&flat_h, &flat_p, max_lag);
-    let mut caveat = String::new();
+    let mut caveats: Vec<&str> = Vec::new();
     if lag == 0 || lag == max_lag {
-        caveat.push_str(" — на краю окна поиска");
+        caveats.push("задержка упёрлась в край окна поиска");
     }
-    if let Some((p, _)) = period {
-        if (lag as f64 - p as f64 / 2.0).abs() <= (p as f64 * 0.2).max(1.0) {
-            caveat.push_str(" — это полпериода, то есть следствие зеркальности");
-        }
+    if period.is_some_and(|(p, _)| {
+        (lag as f64 - p as f64 / 2.0).abs() <= (p as f64 * 0.2).max(1.0)
+    }) {
+        caveats.push("это полпериода, то есть следствие зеркальности");
     }
-    if mirror < -0.8 && caveat.is_empty() {
-        caveat.push_str(" — но доли почти зеркальны, о причинности судить нельзя");
+    if mirror < -0.8 && caveats.is_empty() {
+        caveats.push("доли почти зеркальны, о причинности судить нельзя");
     }
+    let tail = if caveats.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", caveats.join("; "))
+    };
     eprintln!(
         "жертвы против хищников: задержка {} шагов, корреляция {:.3}{}",
         lag as u64 * every,
         corr,
-        caveat
+        tail
     );
 }
 
