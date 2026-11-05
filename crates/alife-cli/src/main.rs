@@ -38,6 +38,21 @@ enum Cmd {
         /// Остановиться, когда популяция вымерла.
         #[arg(long, default_value_t = true)]
         stop_on_extinction: bool,
+        /// Как часто считать генетику, в шагах; 0 отключает.
+        /// Проекция геномов на порядок дороже остальных метрик.
+        #[arg(long, default_value_t = 2000)]
+        genetics_every: u64,
+        /// Сколько особей брать в выборку для генетики.
+        #[arg(long, default_value_t = 512)]
+        genetics_sample: usize,
+        /// Порог склейки кластеров, в мутационных шагах.
+        #[arg(long, default_value_t = 20.0)]
+        cluster_threshold: f64,
+    },
+    /// Разобрать готовый CSV и повторить выводы о динамике без пересчёта.
+    Report {
+        #[arg(long)]
+        csv: PathBuf,
     },
     /// Вывести конфигурацию по умолчанию.
     Config {
@@ -56,6 +71,40 @@ fn main() {
 
 fn run() -> Result<(), String> {
     match Cli::parse().cmd {
+        Cmd::Report { csv } => {
+            let text = fs::read_to_string(&csv).map_err(|e| format!("{}: {e}", csv.display()))?;
+            let mut lines = text.lines();
+            let header: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
+            let col = |name: &str| {
+                header
+                    .iter()
+                    .position(|h| *h == name)
+                    .ok_or_else(|| format!("в {} нет колонки {name}", csv.display()))
+            };
+            let (i_step, i_pop, i_pred, i_herb) =
+                (col("step")?, col("population")?, col("predators")?, col("herbivores")?);
+
+            let (mut steps, mut population, mut predators, mut herbivores) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for line in lines {
+                let f: Vec<&str> = line.split(',').collect();
+                if f.len() <= i_herb {
+                    continue;
+                }
+                let parse = |i: usize| f[i].parse::<f64>().unwrap_or(0.0);
+                steps.push(parse(i_step) as u64);
+                population.push(parse(i_pop).max(1.0));
+                predators.push(parse(i_pred));
+                herbivores.push(parse(i_herb));
+            }
+            if steps.len() < 2 {
+                return Err(format!("{}: нечего разбирать", csv.display()));
+            }
+            let every = steps[1].saturating_sub(steps[0]).max(1);
+            eprintln!("{}: {} замеров через {} шагов", csv.display(), steps.len(), every);
+            report_dynamics(&population, &herbivores, &predators, every);
+            Ok(())
+        }
         Cmd::Config { out } => {
             let text = toml::to_string_pretty(&Config::default())
                 .map_err(|e| format!("не удалось сериализовать конфиг: {e}"))?;
@@ -69,7 +118,18 @@ fn run() -> Result<(), String> {
             }
             Ok(())
         }
-        Cmd::Run { config, steps, seed, out, every, threads, stop_on_extinction } => {
+        Cmd::Run {
+            config,
+            steps,
+            seed,
+            out,
+            every,
+            threads,
+            stop_on_extinction,
+            genetics_every,
+            genetics_sample,
+            cluster_threshold,
+        } => {
             let mut cfg = match config {
                 Some(path) => {
                     let text = fs::read_to_string(&path)
@@ -119,11 +179,24 @@ fn run() -> Result<(), String> {
             // Замер обнуляет счётчики интервала, поэтому лишний замер сразу после
             // предыдущего дал бы строку с нулями во всех метриках событий.
             let mut sampled_last_tick = false;
+            // Ряды для проверки цикла Лотки–Вольтерры: численность хищников
+            // должна повторять численность жертв с задержкой.
+            let mut herbivores: Vec<f64> = Vec::new();
+            let mut predators: Vec<f64> = Vec::new();
+            let mut population: Vec<f64> = Vec::new();
             for step in 1..=steps {
                 sim.tick();
                 sampled_last_tick = false;
                 if step % every == 0 || step == steps {
-                    let s = sim.sample();
+                    let with_genetics = genetics_every > 0 && step % genetics_every == 0;
+                    let s = if with_genetics {
+                        sim.sample_full(genetics_sample, cluster_threshold)
+                    } else {
+                        sim.sample()
+                    };
+                    herbivores.push(s.herbivores as f64);
+                    predators.push(s.predators as f64);
+                    population.push(s.population.max(1) as f64);
                     csv.write(&s).map_err(|e| format!("{}: {e}", out.display()))?;
                     sampled_last_tick = true;
                     if last_report.elapsed().as_secs_f64() > 1.0 || step == steps {
@@ -155,10 +228,98 @@ fn run() -> Result<(), String> {
             );
             let drift = (sim.total_mass() - sim.initial_mass()).abs() / sim.initial_mass();
             eprintln!("уход массы за прогон: {:.2e}", drift);
+
+            let ph = sim.phylo_stats();
+            eprintln!(
+                "филогения: {} узлов, выживших линий {}, общий предок в поколении {} (шаг {})",
+                ph.nodes, ph.roots, ph.mrca_generation, ph.mrca_step
+            );
+            if genetics_every > 0 {
+                let thresholds = [2.0, 5.0, 10.0, 20.0, 40.0];
+                let scan = sim.genetics_scan(genetics_sample, &thresholds);
+                if let Some(g) = scan.first() {
+                    eprintln!(
+                        "разнообразие по {} особям: расстояние между геномами {:.1} мутационных шагов (медиана {:.1}, от {:.1} до {:.1})",
+                        g.sampled, g.mean_distance, g.median_distance, g.p10_distance, g.p90_distance
+                    );
+                }
+                let parts: Vec<String> = scan
+                    .iter()
+                    .map(|g| {
+                        format!(
+                            "{:.0} -> {} ({:.0}%)",
+                            g.threshold,
+                            g.clusters,
+                            g.largest_cluster_share * 100.0
+                        )
+                    })
+                    .collect();
+                eprintln!("кластеров при порогах (в крупнейшем): {}", parts.join(", "));
+            }
+            report_dynamics(&population, &herbivores, &predators, every);
             eprintln!("метрики: {}", out.display());
             Ok(())
         }
     }
+}
+
+/// Разбор колебаний численности. Вынесен отдельно, чтобы одни и те же выводы
+/// делались и по свежему прогону, и по сохранённому CSV.
+fn report_dynamics(population: &[f64], herbivores: &[f64], predators: &[f64], every: u64) {
+    if herbivores.len() <= 40 {
+        eprintln!("замеров слишком мало, чтобы судить о колебаниях");
+        return;
+    }
+    // Ряды нестационарны, пока охота разворачивается: численность хищных
+    // растёт весь прогон. Без вычитания тренда корреляция меряет этот рост.
+    let window = (herbivores.len() / 8).max(5) | 1;
+    let flat_h = alife_core::detrend(herbivores, window);
+    let flat_p = alife_core::detrend(predators, window);
+    let max_lag = herbivores.len() / 8;
+    // Период ищется в более широком окне: искомая величина заведомо больше
+    // задержек, которые имеет смысл перебирать в кросс-корреляции.
+    let period = alife_core::oscillation_period(&flat_p, herbivores.len() / 3);
+    match period {
+        Some((lag, corr)) => eprintln!(
+            "численность хищных колеблется: период около {} шагов (автокорреляция возвращается к {:.2})",
+            lag as u64 * every,
+            corr
+        ),
+        None => eprintln!("численность хищных не колеблется: периода не видно"),
+    }
+
+    // Хищные и травоядные делят одну популяцию, поэтому их доли могут
+    // оказаться почти зеркальными. У зеркальных рядов пик кросс-корреляции
+    // всегда приходится на полпериода, что бы ни происходило на самом деле.
+    let share = |xs: &[f64]| -> Vec<f64> {
+        xs.iter().zip(population).map(|(x, p)| x / p).collect()
+    };
+    let mirror = alife_core::lagged_correlation(
+        &alife_core::detrend(&share(herbivores), window),
+        &alife_core::detrend(&share(predators), window),
+        0,
+    );
+    eprintln!("зеркальность долей хищных и травоядных: {mirror:.2}");
+
+    let (lag, corr) = alife_core::best_lag(&flat_h, &flat_p, max_lag);
+    let mut caveat = String::new();
+    if lag == 0 || lag == max_lag {
+        caveat.push_str(" — на краю окна поиска");
+    }
+    if let Some((p, _)) = period {
+        if (lag as f64 - p as f64 / 2.0).abs() <= (p as f64 * 0.2).max(1.0) {
+            caveat.push_str(" — это полпериода, то есть следствие зеркальности");
+        }
+    }
+    if mirror < -0.8 && caveat.is_empty() {
+        caveat.push_str(" — но доли почти зеркальны, о причинности судить нельзя");
+    }
+    eprintln!(
+        "жертвы против хищников: задержка {} шагов, корреляция {:.3}{}",
+        lag as u64 * every,
+        corr,
+        caveat
+    );
 }
 
 fn write_parents(path: &Path) -> Result<(), String> {

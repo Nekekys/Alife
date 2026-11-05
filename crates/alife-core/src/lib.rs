@@ -15,13 +15,19 @@
 pub mod agents;
 pub mod brain;
 pub mod config;
+pub mod genetics;
 pub mod metrics;
+pub mod phylo;
 pub mod rng;
 pub mod sense;
 pub mod sim;
 pub mod world;
 
 pub use config::Config;
-pub use metrics::{CsvWriter, Sample};
+pub use genetics::Genetics;
+pub use metrics::{
+    best_lag, detrend, lagged_correlation, oscillation_period, CsvWriter, DietSplit, Sample,
+};
+pub use phylo::PhyloStats;
 pub use sim::{Action, Inspection, Sim};
 pub use world::World;

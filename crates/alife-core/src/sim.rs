@@ -9,7 +9,9 @@ use rayon::prelude::*;
 use crate::agents::Agents;
 use crate::brain::{BrainSpec, Scratch, N_OUTPUTS};
 use crate::config::Config;
-use crate::metrics::{Counters, Sample};
+use crate::genetics::{self, Genetics, Projector};
+use crate::metrics::{Counters, DietSplit, Sample};
+use crate::phylo::{Phylogeny, PhyloStats};
 use crate::rng::Rng;
 use crate::sense::{sense, Scales, SensorSpec};
 use crate::world::{World, NO_AGENT};
@@ -44,6 +46,10 @@ pub struct Sim {
     pub rng: Rng,
     pub step: u64,
     pub counters: Counters,
+    /// Дерево предков ныне живущих; мёртвые ветви отсекаются сразу.
+    pub phylo: Phylogeny,
+    /// Случайная проекция генома для метрик разнообразия.
+    pub projector: Projector,
     live_idx: Vec<u32>,
     actions: Vec<Action>,
     initial_mass: f64,
@@ -73,6 +79,7 @@ impl Sim {
             world.nutrient[i] = per_cell - plant0;
         }
 
+        let mut phylo = Phylogeny::new();
         let mut genome = vec![0.0f32; brain.genome_len];
         for _ in 0..cfg.world.init_agents {
             let mut spot = None;
@@ -97,12 +104,15 @@ impl Sim {
                 Some(s) => s,
                 None => break,
             };
-            agents.spawn(slot, x, y, cfg.agent.birth_energy, 0, 0, 0);
+            let id = agents.spawn(slot, x, y, cfg.agent.birth_energy, 0, 0, 0);
+            phylo.birth(id, 0, 0, 0);
             brain.random_genome(&mut rng, &mut genome);
             agents.genome_mut(slot).copy_from_slice(&genome);
             world.occupant[c] = slot as u32;
         }
 
+        let brain_genome_len = brain.genome_len;
+        let cfg_seed = cfg.seed;
         let mut sim = Self {
             cfg,
             world,
@@ -113,6 +123,8 @@ impl Sim {
             rng,
             step: 0,
             counters: Counters::default(),
+            phylo,
+            projector: Projector::new(brain_genome_len, GENETIC_DIM, cfg_seed ^ 0x5EED),
             live_idx: Vec::new(),
             actions: Vec::new(),
             initial_mass: 0.0,
@@ -195,7 +207,8 @@ impl Sim {
 
     /// Последовательная часть шага: порядок применения действий — по слотам.
     fn act(&mut self) {
-        let Sim { cfg, world, agents, rng, counters, live_idx, actions, .. } = self;
+        let Sim { cfg, world, agents, rng, counters, live_idx, actions, phylo, step, .. } = self;
+        let now = *step;
 
         for &s in live_idx.iter() {
             let i = s as usize;
@@ -239,8 +252,9 @@ impl Sim {
                     counters.attacks_hit += 1;
                     counters.damage_dealt += dmg as f64;
                     counters.predated_mass += bite as f64;
+                    agents.eaten_animal[i] += bite;
                     if agents.energy[v] <= cfg.agent.death_energy {
-                        kill(world, agents, v);
+                        kill(world, agents, phylo, v);
                         counters.deaths_killed += 1;
                     }
                 }
@@ -276,6 +290,8 @@ impl Sim {
                         counters.eats += 1;
                         counters.eaten_plant += from_plant as f64;
                         counters.eaten_carrion += from_carrion as f64;
+                        agents.eaten_plant[i] += from_plant;
+                        agents.eaten_animal[i] += from_carrion;
                     }
                 }
             }
@@ -306,7 +322,8 @@ impl Sim {
                             let pid = agents.id[i];
                             let lin = agents.lineage[i];
                             let gen = agents.generation[i].saturating_add(1);
-                            agents.spawn(child, nx, ny, child_e, pid, lin, gen);
+                            let child_id = agents.spawn(child, nx, ny, child_e, pid, lin, gen);
+                            phylo.birth(child_id, pid, now, gen);
                             agents.copy_genome(i, child);
 
                             let sigma = cfg.agent.mutation_sigma;
@@ -337,7 +354,7 @@ impl Sim {
             agents.age[i] = agents.age[i].saturating_add(1);
 
             if agents.energy[i] <= cfg.agent.death_energy {
-                kill(world, agents, i);
+                kill(world, agents, phylo, i);
                 counters.deaths_starved += 1;
             }
         }
@@ -345,6 +362,9 @@ impl Sim {
 
     /// Снимает замер и обнуляет счётчики интервала.
     pub fn sample(&mut self) -> Sample {
+        // Судить о рационе можно, когда съедено хотя бы с собственный вес.
+        let diet = self.diet_split(self.cfg.agent.birth_energy, MEAT_THRESHOLD);
+        let phylo = self.phylo_stats();
         let (plant, carrion, nutrient) = self.world.pool_totals();
         let mut mass_agents = 0.0f64;
         let mut sum_age = 0.0f64;
@@ -393,9 +413,29 @@ impl Sim {
             attacks_per_agent: c.attacks as f64 / denom,
             eaten_per_agent: (c.eaten_plant + c.eaten_carrion) / denom,
             births_blocked: c.births_blocked,
+            predators: diet.predators as u64,
+            herbivores: diet.herbivores as u64,
+            phylo_nodes: phylo.nodes as u64,
+            lineages: phylo.roots as u64,
+            mrca_generation: phylo.mrca_generation,
+            mrca_step: phylo.mrca_step,
+            ..Default::default()
         };
         self.counters.reset();
         sample
+    }
+
+    /// То же, что [`Self::sample`], плюс генетика. Считается отдельно,
+    /// потому что проекция геномов на порядок дороже остальных метрик.
+    pub fn sample_full(&mut self, genetics_sample: usize, threshold_steps: f64) -> Sample {
+        let g = self.genetics(genetics_sample, threshold_steps);
+        let mut s = self.sample();
+        s.genetics_sampled = g.sampled as u64;
+        s.mean_distance = g.mean_distance;
+        s.median_distance = g.median_distance;
+        s.clusters = g.clusters as u64;
+        s.largest_cluster_share = g.largest_cluster_share;
+        s
     }
 
     /// Кто стоит в клетке. Нужно просмотрщику, чтобы выбрать особь по щелчку.
@@ -429,6 +469,119 @@ impl Sim {
         Some(Inspection { inputs, outputs, action })
     }
 
+    /// Ожидаемое расстояние между геномами родителя и потомка после одной мутации.
+    /// В нём меряются все генетические расстояния: иначе числа зависели бы
+    /// от длины генома и ничего не значили сами по себе.
+    pub fn mutation_step(&self) -> f32 {
+        self.cfg.agent.mutation_sigma * (self.brain.genome_len as f32).sqrt()
+    }
+
+    /// Разнообразие по выборке живых особей.
+    ///
+    /// `threshold_steps` — на сколько мутационных шагов могут разойтись соседи
+    /// внутри одного кластера. Число кластеров сильно зависит от этого порога,
+    /// поэтому рядом всегда стоит распределение расстояний.
+    pub fn genetics(&self, sample: usize, threshold_steps: f64) -> Genetics {
+        let slots = self.sample_live(sample);
+        if slots.len() < 2 {
+            return Genetics {
+                sampled: slots.len(),
+                threshold: threshold_steps,
+                clusters: slots.len(),
+                ..Default::default()
+            };
+        }
+        let sketches = genetics::sketch_all(
+            &self.projector,
+            &self.agents.genomes,
+            self.brain.genome_len,
+            &slots,
+        );
+        genetics::analyse(
+            &sketches,
+            self.projector.dim,
+            self.mutation_step(),
+            threshold_steps,
+        )
+    }
+
+    /// Разнообразие сразу при нескольких порогах склейки.
+    ///
+    /// Число кластеров всегда зависит от порога, и одна цифра без этой
+    /// зависимости вводит в заблуждение. Подписи считаются один раз на всех.
+    pub fn genetics_scan(&self, sample: usize, thresholds: &[f64]) -> Vec<Genetics> {
+        let slots = self.sample_live(sample);
+        if slots.len() < 2 {
+            return thresholds
+                .iter()
+                .map(|&t| Genetics {
+                    sampled: slots.len(),
+                    threshold: t,
+                    clusters: slots.len(),
+                    ..Default::default()
+                })
+                .collect();
+        }
+        let sketches = genetics::sketch_all(
+            &self.projector,
+            &self.agents.genomes,
+            self.brain.genome_len,
+            &slots,
+        );
+        let step = self.mutation_step();
+        thresholds
+            .iter()
+            .map(|&t| genetics::analyse(&sketches, self.projector.dim, step, t))
+            .collect()
+    }
+
+    /// Равномерная выборка живых слотов. Генератор не трогается: выборка
+    /// зависит только от состояния, поэтому замер не влияет на прогон.
+    fn sample_live(&self, sample: usize) -> Vec<u32> {
+        let live: Vec<u32> = (0..self.agents.capacity)
+            .filter(|&i| self.agents.alive[i])
+            .map(|i| i as u32)
+            .collect();
+        if sample == 0 || live.len() <= sample {
+            return live;
+        }
+        let stride = live.len() as f64 / sample as f64;
+        (0..sample)
+            .map(|k| live[(((k as f64 + 0.5) * stride) as usize).min(live.len() - 1)])
+            .collect()
+    }
+
+    /// Делит популяцию на хищников и травоядных по тому, что они съели за жизнь.
+    ///
+    /// Это не виды и не генетические группы: особь попадает в ту или другую
+    /// половину по своему рациону. Пока съедено слишком мало, судить не о чем.
+    pub fn diet_split(&self, min_intake: f32, meat_threshold: f32) -> DietSplit {
+        let mut split = DietSplit::default();
+        for i in 0..self.agents.capacity {
+            if !self.agents.alive[i] {
+                continue;
+            }
+            let plant = self.agents.eaten_plant[i];
+            let animal = self.agents.eaten_animal[i];
+            let total = plant + animal;
+            if total < min_intake {
+                split.undecided += 1;
+            } else if animal / total >= meat_threshold {
+                split.predators += 1;
+            } else {
+                split.herbivores += 1;
+            }
+        }
+        split
+    }
+
+    pub fn phylo_stats(&self) -> PhyloStats {
+        let living = (0..self.agents.capacity)
+            .find(|&i| self.agents.alive[i])
+            .map(|i| self.agents.id[i]);
+        self.phylo.stats(living)
+    }
+
     /// Отпечаток полного состояния: им проверяется воспроизводимость прогонов.
     pub fn state_hash(&self) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -454,13 +607,21 @@ impl Sim {
     }
 }
 
-fn kill(world: &mut World, agents: &mut Agents, i: usize) {
+fn kill(world: &mut World, agents: &mut Agents, phylo: &mut Phylogeny, i: usize) {
     let c = world.idx(agents.x[i] as usize, agents.y[i] as usize);
     debug_assert_eq!(world.occupant[c], i as u32);
     world.carrion[c] += agents.energy[i];
     world.occupant[c] = NO_AGENT;
+    phylo.death(agents.id[i]);
     agents.release(i);
 }
+
+/// Длина подписи генома для метрик разнообразия. Шестьдесят четыре измерения
+/// держат ошибку расстояния в пределах нескольких процентов.
+const GENETIC_DIM: usize = 64;
+
+/// Доля мяса в рационе, начиная с которой особь считается хищной.
+const MEAT_THRESHOLD: f32 = 0.5;
 
 /// Выходы сети: [стоять, север, юг, запад, восток, есть, атаковать, размножиться].
 /// Направление — максимум из четырёх направленных выходов; движение происходит,
@@ -576,6 +737,76 @@ mod tests {
             assert!(bite <= room, "укус больше, чем вмещает атакующий");
             assert!((bite + dropped - d).abs() < 1e-6, "сумма долей не равна урону");
         }
+    }
+
+    #[test]
+    fn phylogeny_tracks_the_living_population() {
+        let mut sim = Sim::new(small_cfg()).unwrap();
+        for _ in 0..800 {
+            sim.tick();
+            assert_eq!(
+                sim.phylo.living() as usize,
+                sim.population(),
+                "дерево разошлось с популяцией на шаге {}",
+                sim.step
+            );
+        }
+        let stats = sim.phylo_stats();
+        // Дерево держит только предков живых, поэтому оно не может расти
+        // без границ: узлов не больше, чем живых особей, умноженных на глубину.
+        assert!(stats.nodes >= sim.population(), "предков меньше, чем живых");
+        assert!(stats.roots >= 1);
+        assert!(stats.max_generation > 0, "за 800 шагов не сменилось ни одного поколения");
+    }
+
+    #[test]
+    fn a_dying_lineage_releases_its_nodes() {
+        let mut sim = Sim::new(small_cfg()).unwrap();
+        for _ in 0..300 {
+            sim.tick();
+        }
+        let before = sim.phylo_stats().nodes;
+        // Убиваем всех: дерево обязано опустеть целиком.
+        let live: Vec<usize> = (0..sim.agents.capacity).filter(|&i| sim.agents.alive[i]).collect();
+        for i in live {
+            kill(&mut sim.world, &mut sim.agents, &mut sim.phylo, i);
+        }
+        assert_eq!(sim.population(), 0);
+        assert_eq!(sim.phylo_stats().nodes, 0, "из {before} узлов остались висеть мёртвые");
+    }
+
+    #[test]
+    fn diet_split_covers_everyone() {
+        let mut sim = Sim::new(small_cfg()).unwrap();
+        for _ in 0..400 {
+            sim.tick();
+        }
+        let d = sim.diet_split(sim.cfg.agent.birth_energy, 0.5);
+        assert_eq!(
+            d.predators + d.herbivores + d.undecided,
+            sim.population(),
+            "кто-то не попал ни в одну группу"
+        );
+    }
+
+    #[test]
+    fn genetics_sees_a_population_descended_from_one_ancestor_as_close() {
+        let mut cfg = small_cfg();
+        cfg.world.init_agents = 1;
+        let mut sim = Sim::new(cfg).unwrap();
+        for _ in 0..600 {
+            sim.tick();
+        }
+        if sim.population() < 8 {
+            return; // потомства не вышло, судить не о чем
+        }
+        let g = sim.genetics(128, 20.0);
+        assert!(g.sampled >= 8);
+        // Все происходят от одного генома, значит расстояния малы по сравнению
+        // с теми, что дают независимые геномы: те отстоят на сотни шагов.
+        assert!(g.mean_distance < 100.0, "родня разошлась на {} шагов", g.mean_distance);
+        assert!(g.p10_distance <= g.median_distance);
+        assert!(g.median_distance <= g.p90_distance);
     }
 
     #[test]

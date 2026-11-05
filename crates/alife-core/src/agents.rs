@@ -23,6 +23,10 @@ pub struct Agents {
     pub last_ate: Vec<f32>,
     /// Била ли её кто-то на прошлом шаге — вход сенсора.
     pub last_hit: Vec<f32>,
+    /// Съедено за жизнь растительной массы.
+    pub eaten_plant: Vec<f32>,
+    /// Съедено за жизнь животной: укусы и падаль вместе.
+    pub eaten_animal: Vec<f32>,
     pub genomes: Vec<f32>,
     free: Vec<u32>,
     live: usize,
@@ -50,6 +54,8 @@ impl Agents {
             generation: vec![0; capacity],
             last_ate: vec![0.0; capacity],
             last_hit: vec![0.0; capacity],
+            eaten_plant: vec![0.0; capacity],
+            eaten_animal: vec![0.0; capacity],
             genomes: vec![0.0; capacity * genome_len],
             free,
             live: 0,
@@ -104,6 +110,8 @@ impl Agents {
         self.age[slot] = 0;
         self.last_ate[slot] = 0.0;
         self.last_hit[slot] = 0.0;
+        self.eaten_plant[slot] = 0.0;
+        self.eaten_animal[slot] = 0.0;
         let id = self.next_id;
         self.next_id += 1;
         self.id[slot] = id;

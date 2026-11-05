@@ -8,7 +8,8 @@ use eframe::egui::{self, Color32};
 
 use crate::charts::line_chart;
 use crate::worldview::{ColorMode, WorldView};
-use crate::{help, inspector};
+use crate::diversity::DiversityState;
+use crate::{diversity, help, inspector};
 
 /// Сколько замеров держим для графиков.
 const HISTORY: usize = 1200;
@@ -23,6 +24,7 @@ struct Selected {
 enum Tab {
     Controls,
     Agent,
+    Diversity,
     Help,
 }
 
@@ -44,6 +46,7 @@ pub struct ViewerApp {
     /// Счётчик щелчков по «случайной особи»: на паузе шаг не меняется,
     /// и без него кнопка возвращала бы одну и ту же особь.
     pick_counter: u64,
+    diversity: DiversityState,
 }
 
 impl ViewerApp {
@@ -66,6 +69,7 @@ impl ViewerApp {
             status: String::new(),
             tab: Tab::Controls,
             pick_counter: 0,
+            diversity: DiversityState::default(),
         })
     }
 
@@ -76,6 +80,7 @@ impl ViewerApp {
             Ok(sim) => {
                 self.sim = sim;
                 self.history.clear();
+                self.diversity = DiversityState::default();
                 self.selected = None;
                 self.view.request_fit();
                 self.status = format!("новый прогон, сид {}", self.seed);
@@ -113,6 +118,9 @@ impl ViewerApp {
                     self.history.remove(0);
                 }
                 self.history.push(s);
+            }
+            if self.diversity.every > 0 && self.sim.step % self.diversity.every == 0 {
+                self.diversity.recompute(&self.sim);
             }
             if self.sim.extinct() {
                 self.running = false;
@@ -315,6 +323,7 @@ impl eframe::App for ViewerApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Controls, "управление");
                     ui.selectable_value(&mut self.tab, Tab::Agent, "особь");
+                    ui.selectable_value(&mut self.tab, Tab::Diversity, "разнообразие");
                     ui.selectable_value(&mut self.tab, Tab::Help, "что происходит");
                 });
                 ui.separator();
@@ -328,6 +337,12 @@ impl eframe::App for ViewerApp {
                             );
                         }
                     },
+                    Tab::Diversity => diversity::show(
+                        ui,
+                        &self.sim,
+                        &mut self.diversity,
+                        &self.history,
+                    ),
                     Tab::Help => help::show(ui, &self.sim),
                 });
             });
